@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# Local scratch
+PR_DESCRIPTION.md
+VIDEO_SCRIPT.md

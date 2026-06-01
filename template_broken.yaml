@@ -1,0 +1,117 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Web App Infrastructure - BROKEN (over-provisioned, wasteful)
+
+# PROBLEMS:
+# 1. t2.2xlarge instances — old generation, oversized for a simple web app
+# 2. 3 instances running 24/7 — no auto-scaling, paying even with zero traffic
+# 3. No lifecycle hooks — instances killed abruptly, drops active connections
+# 4. No cost tags — impossible to track spending by team or project
+# 5. GP2 storage — older, more expensive than GP3
+# 6. No scaling policies — manual intervention needed for traffic spikes
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+
+Resources:
+
+  # Security group
+  WebSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Web server access
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+
+  # PROBLEM: 3 separate oversized EC2 instances, running 24/7
+  WebServer1:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t2.2xlarge          # WASTE: 8 vCPU, 32GB RAM for a web app
+      ImageId: ami-0c55b159cbfafe1f0
+      KeyName: !Ref KeyName
+      SubnetId: !Select [0, !Ref SubnetIds]
+      SecurityGroupIds:
+        - !Ref WebSecurityGroup
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 100             # WASTE: 100GB for a web app
+            VolumeType: gp2             # WASTE: old generation, use gp3
+
+  WebServer2:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t2.2xlarge
+      ImageId: ami-0c55b159cbfafe1f0
+      KeyName: !Ref KeyName
+      SubnetId: !Select [1, !Ref SubnetIds]
+      SecurityGroupIds:
+        - !Ref WebSecurityGroup
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 100
+            VolumeType: gp2
+
+  WebServer3:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t2.2xlarge
+      ImageId: ami-0c55b159cbfafe1f0
+      KeyName: !Ref KeyName
+      SubnetId: !Select [0, !Ref SubnetIds]
+      SecurityGroupIds:
+        - !Ref WebSecurityGroup
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 100
+            VolumeType: gp2
+
+  # Load balancer pointing to all 3 instances
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing
+      Subnets: !Ref SubnetIds
+      SecurityGroups:
+        - !Ref WebSecurityGroup
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      HealthCheckPath: /health
+      Targets:
+        - Id: !Ref WebServer1
+        - Id: !Ref WebServer2
+        - Id: !Ref WebServer3
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+Outputs:
+  LoadBalancerDNS:
+    Value: !GetAtt LoadBalancer.DNSName
