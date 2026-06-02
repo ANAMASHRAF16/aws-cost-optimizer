@@ -1,0 +1,168 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Web App Infrastructure - FIXED (right-sized, auto-scaling, tagged)
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues: [production, staging, development]
+
+Resources:
+
+  # Security group (same as before)
+  WebSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Web server access
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      # FIX: Cost tags
+      Tags:
+        - Key: Project
+          Value: web-app
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Team
+          Value: platform
+
+  # FIX: Launch Template instead of individual EC2 instances
+  # - Right-sized instance type (t3.medium instead of t2.2xlarge)
+  # - GP3 storage (cheaper + faster than GP2)
+  # - Cost tags on every instance
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: web-app-template
+      LaunchTemplateData:
+        InstanceType: t3.medium              # FIX: 2 vCPU, 4GB RAM (was 8 vCPU, 32GB)
+        ImageId: ami-0c55b159cbfafe1f0
+        KeyName: !Ref KeyName
+        SecurityGroupIds:
+          - !Ref WebSecurityGroup
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: 20                 # FIX: 20GB (was 100GB)
+              VolumeType: gp3               # FIX: gp3 (was gp2) — cheaper + faster
+        # FIX: Cost tags on every instance launched
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: web-app-server
+              - Key: Project
+                Value: web-app
+              - Key: Environment
+                Value: !Ref Environment
+              - Key: Team
+                Value: platform
+              - Key: ManagedBy
+                Value: auto-scaling
+          - ResourceType: volume
+            Tags:
+              - Key: Project
+                Value: web-app
+              - Key: Environment
+                Value: !Ref Environment
+
+  # FIX: Auto Scaling Group (replaces 3 hardcoded EC2 instances)
+  # - Min 1 instance (low traffic / night time)
+  # - Max 4 instances (high traffic / peak hours)
+  # - Desired 2 instances (normal traffic)
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: web-app-asg
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MinSize: 1                             # FIX: scale down to 1 at night
+      MaxSize: 4                             # FIX: scale up to 4 at peak
+      DesiredCapacity: 2                     # FIX: start with 2 (was always 3)
+      VPCZoneIdentifier: !Ref SubnetIds
+      TargetGroupARNs:
+        - !Ref TargetGroup
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 120
+      # FIX: Lifecycle hooks — graceful shutdown
+      LifecycleHookSpecificationList:
+        - LifecycleTransition: autoscaling:EC2_INSTANCE_TERMINATING
+          LifecycleHookName: graceful-shutdown-hook
+          HeartbeatTimeout: 300              # 5 minutes to drain connections
+          DefaultResult: CONTINUE            # proceed after timeout
+      Tags:
+        - Key: Project
+          Value: web-app
+          PropagateAtLaunch: true
+        - Key: Environment
+          Value: !Ref Environment
+          PropagateAtLaunch: true
+
+  # FIX: Scale UP policy — add instances when CPU > 70%
+  ScaleUpPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 70                      # add instance when CPU > 70%
+
+  # Load balancer (same, but with tags)
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing
+      Subnets: !Ref SubnetIds
+      SecurityGroups:
+        - !Ref WebSecurityGroup
+      Tags:
+        - Key: Project
+          Value: web-app
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Team
+          Value: platform
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      HealthCheckPath: /health
+      # FIX: No hardcoded targets — ASG manages instances automatically
+      Tags:
+        - Key: Project
+          Value: web-app
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+Outputs:
+  LoadBalancerDNS:
+    Value: !GetAtt LoadBalancer.DNSName
+  AutoScalingGroupName:
+    Value: !Ref AutoScalingGroup
